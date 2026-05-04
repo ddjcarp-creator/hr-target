@@ -5,8 +5,8 @@ import requests
 from datetime import date, timedelta
 from pybaseball import statcast_batter, pitching_stats
 
-st.set_page_config(page_title="HR Targets ELITE", layout="wide")
-st.title("⚾ HR Targets ELITE (Real Matchups)")
+st.set_page_config(page_title="HR Targets REAL", layout="wide")
+st.title("⚾ HR Targets REAL (True Matchups)")
 
 # -------------------------
 # SETTINGS
@@ -15,12 +15,12 @@ days = st.slider("Recent Form (days)", 7, 60, 30)
 min_prob = st.slider("Min HR Probability", 0, 100, 55)
 
 # -------------------------
-# GET TODAY'S GAMES + PITCHERS
+# GET SCHEDULE + PITCHERS
 # -------------------------
 @st.cache_data
 def get_games():
     today = date.today()
-    url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={today}&hydrate=probablePitcher"
+    url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={today}&hydrate=probablePitcher,team"
     data = requests.get(url).json()
 
     games = []
@@ -30,6 +30,8 @@ def get_games():
             games.append({
                 "home_team": g["teams"]["home"]["team"]["name"],
                 "away_team": g["teams"]["away"]["team"]["name"],
+                "home_id": g["teams"]["home"]["team"]["id"],
+                "away_id": g["teams"]["away"]["team"]["id"],
                 "home_pitcher": g["teams"]["home"].get("probablePitcher", {}).get("fullName"),
                 "away_pitcher": g["teams"]["away"].get("probablePitcher", {}).get("fullName"),
             })
@@ -39,10 +41,31 @@ def get_games():
 games = get_games()
 
 st.subheader("📅 Today's Matchups")
-st.dataframe(games, use_container_width=True)
+st.dataframe(games)
 
 # -------------------------
-# LOAD HITTER DATA
+# GET TEAM ROSTERS (REAL)
+# -------------------------
+@st.cache_data
+def get_team_hitters(team_id):
+    url = f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster"
+    data = requests.get(url).json()
+
+    players = []
+    for p in data.get("roster", []):
+        if p["position"]["type"] == "Hitter":
+            players.append(p["person"]["fullName"])
+
+    return players
+
+team_hitters = {}
+
+for _, g in games.iterrows():
+    team_hitters[g["home_team"]] = get_team_hitters(g["home_id"])
+    team_hitters[g["away_team"]] = get_team_hitters(g["away_id"])
+
+# -------------------------
+# LOAD STATCAST
 # -------------------------
 @st.cache_data
 def load_hitters(days):
@@ -61,10 +84,10 @@ def load_hitters(days):
     df["HR"] = df["events"] == "home_run"
     return df
 
-hitters_raw = load_hitters(days)
+raw = load_hitters(days)
 
 # -------------------------
-# BUILD HITTER STATS
+# BUILD STATS
 # -------------------------
 def build_stats(df):
     g = df.groupby("player_name")
@@ -86,29 +109,27 @@ def build_stats(df):
         lambda x: np.mean(x["launch_angle"] > 25)
     ) * 100
 
-    stats = stats.reset_index()
-    return stats
+    return stats.reset_index()
 
-hitters = build_stats(hitters_raw)
-
-# -------------------------
-# LOAD PITCHER STATS
-# -------------------------
-@st.cache_data
-def load_pitchers():
-    p = pitching_stats(2025)
-    return p[["Name", "HR/9"]]
-
-pitchers = load_pitchers()
+hitters = build_stats(raw)
 
 # -------------------------
-# MATCHUP ENGINE (REAL)
+# ASSIGN REAL TEAMS
 # -------------------------
-# assign each hitter a random team matchup (simplified)
-teams = list(set(games["home_team"].tolist() + games["away_team"].tolist()))
+def find_team(player):
+    for team, roster in team_hitters.items():
+        if player in roster:
+            return team
+    return None
 
-hitters["Team"] = np.random.choice(teams, len(hitters))
+hitters["Team"] = hitters["player_name"].apply(find_team)
 
+# remove players not in today's games
+hitters = hitters.dropna(subset=["Team"])
+
+# -------------------------
+# MAP OPPOSING PITCHER
+# -------------------------
 def get_opposing_pitcher(team):
     for _, g in games.iterrows():
         if g["home_team"] == team:
@@ -119,7 +140,16 @@ def get_opposing_pitcher(team):
 
 hitters["Opp Pitcher"] = hitters["Team"].apply(get_opposing_pitcher)
 
-# merge pitcher stats
+# -------------------------
+# LOAD PITCHERS
+# -------------------------
+@st.cache_data
+def load_pitchers():
+    p = pitching_stats(2025)
+    return p[["Name", "HR/9"]]
+
+pitchers = load_pitchers()
+
 hitters = hitters.merge(
     pitchers,
     left_on="Opp Pitcher",
@@ -134,7 +164,7 @@ hitters["HR/9"] = hitters["HR/9"].fillna(1.4)
 # -------------------------
 hitters["Park Factor"] = np.random.uniform(0.9, 1.2, len(hitters))
 
-def weather_boost():
+def weather():
     temp = np.random.uniform(10, 35)
     wind = np.random.uniform(0, 20)
 
@@ -146,10 +176,10 @@ def weather_boost():
 
     return boost
 
-hitters["Weather"] = [weather_boost() for _ in range(len(hitters))]
+hitters["Weather"] = [weather() for _ in range(len(hitters))]
 
 # -------------------------
-# HR MODEL (MATCHUP BASED)
+# HR MODEL
 # -------------------------
 def hr_model(row):
     return (
@@ -174,11 +204,11 @@ filtered = hitters[
 
 top = filtered.sort_values("HR Probability", ascending=False).head(10)
 
-st.subheader("🔥 TOP HR PICKS (REAL MATCHUPS)")
+st.subheader("🔥 REAL MATCHUP HR PICKS")
 st.dataframe(top, use_container_width=True)
 
 # -------------------------
-# PLAYER BREAKDOWN
+# PLAYER VIEW
 # -------------------------
 player = st.selectbox("Select Player", hitters["player_name"])
 
